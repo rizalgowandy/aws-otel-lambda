@@ -2,108 +2,59 @@ name: Main Build
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+      - release/*
+    paths-ignore:
+      - '.github/**'
+      - '!.github/workflows/main-build.yml'
+      - '!.github/workflows/main-build-python.yml'
+      - '!.github/workflows/main-build-java.yml'
+      - '!.github/workflows/main-build-nodejs.yml'
+      - '**.md'
   workflow_dispatch:
+
+concurrency:
+  group: main-build-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
   integration-test:
-    runs-on: ubuntu-20.04
-    name: Integration - (${{ matrix.language }}, ${{ matrix.sample-app }}, ${{ matrix.instrumentation-type }}, ${{ matrix.architecture }})
+    runs-on: ubuntu-22.04
+    name: ${{ matrix.language }}-${{ matrix.instrumentation-type }}-${{ matrix.architecture }}
     strategy:
       fail-fast: false
       matrix:
         architecture: [ amd64, arm64 ]
-        language: [ dotnet, go, java, nodejs, python ]
+        language: [ dotnet, go ]
         sample-app: [ aws-sdk ]
         instrumentation-type: [ wrapper ]
-        include:
-          - language: java
-            sample-app: aws-sdk
-            instrumentation-type: agent
-            architecture: amd64
-          - language: java
-            sample-app: aws-sdk
-            instrumentation-type: agent
-            architecture: arm64
-          - language: java
-            sample-app: okhttp
-            instrumentation-type: wrapper
-            architecture: amd64
-          - language: java
-            sample-app: okhttp
-            instrumentation-type: wrapper
-            architecture: arm64
+
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v5
         with:
-          go-version: '^1.17.7'
-      - uses: actions/setup-java@v2
-        if: ${{ matrix.language == 'java' }}
-        with:
-          distribution: adopt
-          java-version: '11'
-      - name: Cache (Java)
-        uses: actions/cache@v2
-        if: ${{ matrix.language == 'java' }}
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-      - uses: actions/setup-node@v2
-        if: ${{ matrix.language == 'nodejs' }}
-        with:
-          node-version: '14'
-      - name: Cache (NodeJS)
-        uses: actions/cache@v2
-        if: ${{ matrix.language == 'nodejs' }}
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package.json') }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-      - uses: actions/setup-python@v2
-        if: ${{ matrix.language == 'python' }}
-        with:
-          python-version: '3.x'
-      - name: Cache (Python)
-        uses: actions/cache@v2
-        if: ${{ matrix.language == 'python' }}
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      - uses: actions/setup-dotnet@v1
+          go-version: '~1.23.4'
+          check-latest: true
+      - uses: actions/setup-dotnet@v4
         if: ${{ matrix.language == 'dotnet' }}
         with:
-          dotnet-version: '3.1.x'
-      - uses: aws-actions/configure-aws-credentials@v1
+          dotnet-version: '6.0.405'
+      - uses: aws-actions/configure-aws-credentials@v4.0.2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
-          role-duration-seconds: 1200
+          role-to-assume: ${{ secrets.INTEG_TEST_LAMBDA_ROLE_ARN }}
+          role-duration-seconds: 7200
           aws-region: us-east-1
       - name: Patch ADOT
         run: ./patch-upstream.sh
-      # Login to ECR since may be needed for Python build image.
-      - name: Login to Public ECR
-        uses: docker/login-action@v1
-        with:
-          registry: public.ecr.aws
       - name: Build layers / functions
-        run: GOARCH=${{ matrix.architecture }} ./build.sh
+        run: GOARCH=${{ matrix.architecture }} ./build.sh ${{ matrix.architecture }}
         working-directory: ${{ matrix.language }}
       - name: Get Lambda Layer amd64 architecture value
         if: ${{ matrix.architecture == 'amd64' }}
@@ -115,7 +66,7 @@ jobs:
         run: |
           echo TERRAFORM_DIRECTORY=${{ matrix.language }}/integration-tests/${{ matrix.sample-app }}/${{ matrix.instrumentation-type }} |
           tee --append $GITHUB_ENV
-      - uses: hashicorp/setup-terraform@v1
+      - uses: hashicorp/setup-terraform@v2
       - name: Initialize terraform
         run: terraform init
         working-directory: ${{ env.TERRAFORM_DIRECTORY }}
@@ -134,15 +85,10 @@ jobs:
         id: extract-endpoint
         run: terraform output -raw api-gateway-url
         working-directory: ${{ env.TERRAFORM_DIRECTORY }}
-      - name: Extract AMP endpoint
-        id: extract-amp-endpoint
-        if: ${{ matrix.language == 'java' && matrix.sample-app == 'aws-sdk' && matrix.instrumentation-type == 'agent' }}
-        run: terraform output -raw amp_endpoint
-        working-directory: ${{ env.TERRAFORM_DIRECTORY }}
       - name: Extract SDK layer arn
         id: extract-sdk-layer-arn
         if: ${{ matrix.language != 'dotnet' && matrix.language != 'go' }}
-        run: terraform output -raw sdk-layer-arn
+        run: terraform output -raw sdk_layer_arn
         working-directory: ${{ env.TERRAFORM_DIRECTORY }}
       - name: Output annotations
         if: ${{ matrix.language != 'dotnet' && matrix.language != 'go' }}
@@ -152,7 +98,7 @@ jobs:
       - name: Send request to endpoint
         run: curl -sS ${{ steps.extract-endpoint.outputs.stdout }}
       - name: Checkout test framework
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           repository: aws-observability/aws-otel-test-framework
           path: test-framework
@@ -162,14 +108,50 @@ jobs:
              test-framework/validator/src/main/resources/expected-data-template/lambdaExpectedTrace.mustache
           cd test-framework
           ./gradlew :validator:run --args="-c default-lambda-validation.yml --endpoint ${{ steps.extract-endpoint.outputs.stdout }} --region $AWS_REGION"
-      - name: validate java agent metric sample
-        if: ${{ matrix.language == 'java' && matrix.sample-app == 'aws-sdk' && matrix.instrumentation-type == 'agent' }}
-        run: |
-          cp adot/utils/expected-templates/${{ matrix.language }}-${{ matrix.sample-app }}-${{ matrix.instrumentation-type }}-metric.json \
-             test-framework/validator/src/main/resources/expected-data-template/ampExpectedMetric.mustache
-          cd test-framework
-          ./gradlew :validator:run --args="-c prometheus-static-metric-validation.yml --cortex-instance-endpoint ${{ steps.extract-amp-endpoint.outputs.stdout }} --region $AWS_REGION"
       - name: Destroy terraform
         if: always()
         run: terraform destroy -auto-approve
         working-directory: ${{ env.TERRAFORM_DIRECTORY }}
+        env:
+          TF_VAR_architecture: ${{ env.LAMBDA_FUNCTION_ARCH }}
+
+  python-runtime-test:
+    concurrency:
+      group: python-runtime-test
+      cancel-in-progress: false
+    uses: ./.github/workflows/main-build-python.yml
+    secrets: inherit
+    with:
+      caller-workflow-name: 'main-build'
+
+  java-runtime-test:
+    concurrency:
+      group: java-runtime-test
+      cancel-in-progress: false
+    uses: ./.github/workflows/main-build-java.yml
+    secrets: inherit
+    with:
+      caller-workflow-name: 'main-build'
+
+  nodejs-runtime-test:
+    concurrency:
+      group: nodejs-runtime-test
+      cancel-in-progress: false
+    uses: ./.github/workflows/main-build-nodejs.yml
+    secrets: inherit
+    with:
+      caller-workflow-name: 'main-build'
+
+  publish-build-status:
+    needs: [integration-test, python-runtime-test, java-runtime-test, nodejs-runtime-test]
+    if: ${{ always() }}
+    uses: ./.github/workflows/publish-status.yml
+    with:
+      namespace: 'ADOT/GitHubActions'
+      repository: ${{ github.repository }}
+      branch: ${{ github.ref_name }}
+      workflow: main-build
+      success: ${{ needs.integration-test.result == 'success' && needs.python-runtime-test.result == 'success' && needs.java-runtime-test.result == 'success' && needs.nodejs-runtime-test.result == 'success' }}
+      region: us-west-2
+    secrets:
+      roleArn: ${{ secrets.METRICS_ROLE_ARN }}

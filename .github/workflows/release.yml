@@ -7,7 +7,7 @@ on:
         description: 'Clone layer from keyword ARN by substituting architecture parameter (ie: arn:aws:lambda:us-east-1:012345678912:layer:aws-otel-nodejs-wrapper-<ARCHITECTURE>-d8b20954c3284abcd08f5fb8178986a89cff7160:1)'
         required: true
       layer_name_keyword:
-        description: 'Publish layer to keyword name by substituting architecture parameter (ie: aws-otel-python38-<ARCHITECTURE>-ver-1-7-1)'
+        description: 'Publish layer to keyword name by substituting architecture parameter (ie: aws-otel-python-<ARCHITECTURE>-ver-1-7-1)'
         required: true
       aws_region:
         description: 'Deploy to aws region'
@@ -26,44 +26,28 @@ on:
 env:
   AMP_REGIONS: us-west-2,us-east-1,us-east-2,eu-central-1,eu-west-1
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   validate-inputs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Validate `layer_name_keyword` (${{ github.event.inputs.layer_name_keyword }})
         run: |
-          grep -Eq "aws-otel-(collector|java-agent|java-wrapper|nodejs|python38)-<ARCHITECTURE>-ver-[0-9]+-[0-9]+-[0-9]+" <<< "${{ github.event.inputs.layer_name_keyword }}"
+          grep -Eq "aws-otel-(collector|java-agent|java-wrapper|nodejs|python)-<ARCHITECTURE>-ver-[0-9]+-[0-9]+-[0-9]+" <<< "${{ github.event.inputs.layer_name_keyword }}"
   publish-prod:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: validate-inputs
     strategy:
       matrix:
-        # TODO: (pvasir) Excluding the following regions from release because
-        # they do not support `arm64` Lambda functions. Update this list when
-        # Lambda expands region support for ARM64.
-        # See more:
-        # https://aws.amazon.com/about-aws/whats-new/2021/09/better-price-performance-aws-lambda-functions-aws-graviton2-processor/
         architecture: ${{ fromJson(github.event.inputs.architecture) }}
         aws_region: ${{ fromJson(github.event.inputs.aws_region) }}
-        exclude:
-          - aws_region: ap-northeast-2
-            architecture: arm64
-          - aws_region: ca-central-1
-            architecture: arm64
-          - aws_region: eu-north-1
-            architecture: arm64
-          - aws_region: eu-west-3
-            architecture: arm64
-          - aws_region: sa-east-1
-            architecture: arm64
-          - aws_region: us-west-1
-            architecture: arm64
     steps:
-      - uses: aws-actions/configure-aws-credentials@v1
+      - uses: aws-actions/configure-aws-credentials@v4.0.2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
+          role-to-assume: ${{ secrets.INTEG_TEST_LAMBDA_ROLE_ARN }}
           role-duration-seconds: 1200
           aws-region: us-east-1
       - name: Get layer ARN by substituting `${{ matrix.architecture }}` into Soak Test ARN keyword
@@ -80,11 +64,9 @@ jobs:
           URL=$(aws lambda get-layer-version-by-arn --arn ${{ env.LAYER_ARN }} --query Content.Location --output text)
           curl $URL -o layer.zip
       # switch to prod
-      - uses: aws-actions/configure-aws-credentials@v1
+      - uses: aws-actions/configure-aws-credentials@v4.0.2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN_PROD }}
+          role-to-assume: ${{ secrets.PROD_LAMBDA_ROLE_ARN }}
           role-duration-seconds: 1200
           aws-region: ${{ matrix.aws_region }}
           mask-aws-account-id: false
@@ -121,22 +103,22 @@ jobs:
             --action lambda:GetLayerVersion
       - name: upload layer arn artifact
         if: ${{ success() }}
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.LAYER_NAME }}
+          name: ${{ env.LAYER_NAME }}-${{matrix.architecture}}-${{matrix.aws_region}}
           path: ${{ env.LAYER_NAME }}/${{ matrix.aws_region }}
       - name: clean s3
         if: always()
         run: |
           aws s3 rb --force s3://${{ env.BUCKET_NAME }}
   generate-note:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: publish-prod
     strategy:
       matrix:
         architecture: ${{ fromJson(github.event.inputs.architecture) }}
     steps:
-      - uses: hashicorp/setup-terraform@v1
+      - uses: hashicorp/setup-terraform@v2
       - name: Get layer name by substituting `${{ matrix.architecture }}` into Workflow Input name keyword
         run: |
           echo LAYER_NAME=$(echo "${{ github.event.inputs.layer_name_keyword }}" | sed 's/<ARCHITECTURE>/${{ matrix.architecture }}/') | tee --append $GITHUB_ENV
@@ -144,10 +126,11 @@ jobs:
         run: |
           echo LAYER_KIND=$(echo "${{ github.event.inputs.layer_name_keyword }}" | cut -d - -f 3) | tee --append $GITHUB_ENV
       - name: download layerARNs
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
-          name: ${{ env.LAYER_NAME }}
+          pattern: ${{ env.LAYER_NAME }}-*
           path: ${{ env.LAYER_NAME }}
+          merge-multiple: true
       - name: show layerARNs
         run: |
           for file in ${{ env.LAYER_NAME }}/*
@@ -188,36 +171,18 @@ jobs:
           terraform fmt layer.tf
           cat layer.tf
       - name: upload layer tf file
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: layer_${{ matrix.architecture }}.tf
           path: layer.tf
   smoke-test:
     name: Smoke Test - (${{ matrix.aws_region }} - ${{ github.event.inputs.layer_name_keyword }} - ${{ matrix.architecture }})
     needs: generate-note
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         architecture: ${{ fromJson(github.event.inputs.architecture) }}
         aws_region: ${{ fromJson(github.event.inputs.aws_region) }}
-        # TODO: (pvasir) Excluding the following regions from release because
-        # they do not support `arm64` Lambda functions. Update this list when
-        # Lambda expands region support for ARM64.
-        # See more:
-        # https://aws.amazon.com/about-aws/whats-new/2021/09/better-price-performance-aws-lambda-functions-aws-graviton2-processor/
-        exclude:
-          - aws_region: ap-northeast-2
-            architecture: arm64
-          - aws_region: ca-central-1
-            architecture: arm64
-          - aws_region: eu-north-1
-            architecture: arm64
-          - aws_region: eu-west-3
-            architecture: arm64
-          - aws_region: sa-east-1
-            architecture: arm64
-          - aws_region: us-west-1
-            architecture: arm64
     steps:
       - name: Parse smoke test values from layer name - ${{ github.event.inputs.layer_name_keyword }}
           # FIXME: (enowell) You can only Smoke Test 1 Sample App with this
@@ -231,7 +196,7 @@ jobs:
           #   test one (`go`).
         run: |
           LAYER_KIND=$(echo "${{ github.event.inputs.layer_name_keyword }}" | cut -d - -f 3)
-          if [ "$LAYER_KIND" = "python38" ]; then
+          if [ "$LAYER_KIND" = "python" ]; then
             TEST_LANGUAGE=python
           elif [ "$LAYER_KIND" = "collector" ]; then
             TEST_LANGUAGE=go
@@ -247,16 +212,16 @@ jobs:
             TEST_INSTR_TYPE="wrapper"
           fi
           echo TEST_INSTR_TYPE=$TEST_INSTR_TYPE | tee --append $GITHUB_ENV
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: actions/setup-java@v2
+      - uses: actions/setup-java@v4
         if: ${{ env.TEST_LANGUAGE == 'java' }}
         with:
-          distribution: adopt
-          java-version: '11'
+          distribution: corretto
+          java-version: '17'
       - name: Cache (Java)
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         if: ${{ env.TEST_LANGUAGE == 'java' }}
         with:
           path: |
@@ -266,12 +231,12 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
-      - uses: actions/setup-node@v2
+      - uses: actions/setup-node@v4
         if: ${{ env.TEST_LANGUAGE == 'nodejs' }}
         with:
-          node-version: '14'
+          node-version: '16'
       - name: Cache (NodeJS)
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         if: ${{ env.TEST_LANGUAGE == 'nodejs' }}
         with:
           path: |
@@ -280,12 +245,12 @@ jobs:
           key: ${{ runner.os }}-node-${{ hashFiles('**/package.json') }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-node-
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v5
         if: ${{ env.TEST_LANGUAGE == 'python' }}
         with:
           python-version: '3.x'
       - name: Cache (Python)
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         if: ${{ env.TEST_LANGUAGE == 'python' }}
         with:
           path: |
@@ -302,15 +267,16 @@ jobs:
       #   with:
       #     dotnet-version: '3.1.x'
       - name: Use Go Language
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         # NOTE: (enowell) In case the languages below need to build the
-        # collector, and because building the collector requires go 1.17 and
-        # above, always setup go 1.17.
+        # collector, and because building the collector requires go 1.18 and
+        # above, always setup go 1.18.
         # if: ${{ env.TEST_LANGUAGE == 'go' }}
         with:
-          go-version: '^1.17.7'
+          go-version: '~1.23.4'
+          check-latest: true
       - name: download layer tf file
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: layer_${{ matrix.architecture }}.tf
       - name: Get terraform directory
@@ -328,16 +294,14 @@ jobs:
         # Also, we NEED the architecture value because some apps (like .NET and
         # Go) depend on this architecture value.
       - name: Build functions
-        run: GOARCH=${{ matrix.architecture }} ./build.sh
+        run: GOARCH=${{ matrix.architecture }} ./build.sh ${{ matrix.architecture }}
         working-directory: ${{ env.TEST_LANGUAGE }}
-      - uses: aws-actions/configure-aws-credentials@v1
+      - uses: aws-actions/configure-aws-credentials@v4.0.2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
+          role-to-assume: ${{ secrets.INTEG_TEST_LAMBDA_ROLE_ARN }}
           role-duration-seconds: 1200
           aws-region: ${{ matrix.aws_region }}
-      - uses: hashicorp/setup-terraform@v1
+      - uses: hashicorp/setup-terraform@v2
       - name: Initialize terraform
         run: terraform init
         working-directory: ${{ env.TERRAFORM_DIRECTORY }}
@@ -365,7 +329,7 @@ jobs:
       - name: Send request to endpoint
         run: curl -sS ${{ steps.extract-endpoint.outputs.stdout }}
       - name: Checkout test framework
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           repository: aws-observability/aws-otel-test-framework
           path: test-framework
@@ -384,3 +348,5 @@ jobs:
         if: always()
         run: terraform destroy -auto-approve
         working-directory: ${{ env.TERRAFORM_DIRECTORY }}
+        env:
+          TF_VAR_architecture: ${{ env.LAMBDA_FUNCTION_ARCH }}

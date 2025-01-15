@@ -8,9 +8,13 @@ on:
 env:
   AMP_REGIONS: us-west-2,us-east-1,us-east-2,eu-central-1,eu-west-1
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   canary-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     name: Canary Test - (${{ matrix.aws_region }} - ${{ matrix.language }} - ${{ matrix.sample-app }} - ${{ matrix.instrumentation-type }} - ${{ matrix.architecture }})
     strategy:
       fail-fast: false
@@ -57,37 +61,21 @@ jobs:
           - language: java
             sample-app: okhttp
             instrumentation-type: agent
-          # TODO: (pvasir) Excluding the following regions from release because
-          # they do not support `arm64` Lambda functions. Update this list when
-          # Lambda expands region support for ARM64.
-          # See more:
-          # https://aws.amazon.com/about-aws/whats-new/2021/09/better-price-performance-aws-lambda-functions-aws-graviton2-processor/
-          - aws_region: ap-northeast-2
-            architecture: arm64
-          - aws_region: ca-central-1
-            architecture: arm64
-          - aws_region: eu-north-1
-            architecture: arm64
-          - aws_region: eu-west-3
-            architecture: arm64
-          - aws_region: sa-east-1
-            architecture: arm64
-          - aws_region: us-west-1
-            architecture: arm64
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v5
         with:
-          go-version: '^1.17.7'
-      - uses: actions/setup-java@v2
+          go-version: '~1.23.4'
+          check-latest: true
+      - uses: actions/setup-java@v4
         if: ${{ matrix.language == 'java' }}
         with:
-          distribution: adopt
-          java-version: '11'
+          distribution: corretto
+          java-version: '17'
       - name: Cache (Java)
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         if: ${{ matrix.language == 'java' }}
         with:
           path: |
@@ -97,12 +85,12 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
-      - uses: actions/setup-node@v2
+      - uses: actions/setup-node@v4
         if: ${{ matrix.language == 'nodejs' }}
         with:
-          node-version: '14'
+          node-version: '18'
       - name: Cache (NodeJS)
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         if: ${{ matrix.language == 'nodejs' }}
         with:
           path: |
@@ -111,12 +99,12 @@ jobs:
           key: ${{ runner.os }}-node-${{ hashFiles('**/package.json') }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-node-
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v5
         if: ${{ matrix.language == 'python' }}
         with:
           python-version: '3.x'
       - name: Cache (Python)
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         if: ${{ matrix.language == 'python' }}
         with:
           path: |
@@ -125,27 +113,25 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-pip-
-      - uses: actions/setup-dotnet@v1
+      - uses: actions/setup-dotnet@v4
         if: ${{ matrix.language == 'dotnet' }}
         with:
-          dotnet-version: '3.1.x'
+          dotnet-version: '6.0.405'
       - name: Patch ADOT
         run: ./patch-upstream.sh
       - name: Build functions
-        run: GOARCH=${{ matrix.architecture }} ./build.sh
+        run: GOARCH=${{ matrix.architecture }} ./build.sh ${{ matrix.architecture }}
         working-directory: ${{ matrix.language }}
-      - uses: aws-actions/configure-aws-credentials@v1
+      - uses: aws-actions/configure-aws-credentials@v4.0.2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
-          role-duration-seconds: 1200
+          role-to-assume: ${{ secrets.INTEG_TEST_LAMBDA_ROLE_ARN }}
+          role-duration-seconds: 7200
           aws-region: ${{ matrix.aws_region }}
       - name: Get terraform directory
         run: |
           echo TERRAFORM_DIRECTORY=${{ matrix.language }}/sample-apps/${{ matrix.sample-app }}/deploy/${{ matrix.instrumentation-type }} |
           tee --append $GITHUB_ENV
-      - uses: hashicorp/setup-terraform@v1
+      - uses: hashicorp/setup-terraform@v2
       - name: Initialize terraform
         run: terraform init
         working-directory: ${{ env.TERRAFORM_DIRECTORY }}
@@ -173,12 +159,12 @@ jobs:
       - name: Send request to endpoint
         run: curl -sS ${{ steps.extract-endpoint.outputs.stdout }}
       - name: Checkout test framework
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           repository: aws-observability/aws-otel-test-framework
           path: test-framework
       - name: validate trace sample
-        uses: nick-invision/retry@v2
+        uses: nick-invision/retry@v3
         with:
           timeout_seconds: 300
           max_attempts: 3
@@ -199,4 +185,18 @@ jobs:
         if: always()
         run: terraform destroy -auto-approve
         working-directory: ${{ env.TERRAFORM_DIRECTORY }}
-  
+        env:
+          TF_VAR_architecture: ${{ env.LAMBDA_FUNCTION_ARCH }}
+  publish-canary-status:
+    needs: [canary-test]
+    if: ${{ always() }}
+    uses: ./.github/workflows/publish-status.yml
+    with:
+      namespace: 'ADOT/GitHubActions'
+      repository: ${{ github.repository }}
+      branch: ${{ github.ref_name }}
+      workflow: canary
+      success: ${{ needs.canary-test.result == 'success' }}
+      region: us-west-2
+    secrets:
+      roleArn: ${{ secrets.METRICS_ROLE_ARN }}

@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -x
+
 SOURCEDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
 # Build collector
@@ -14,7 +16,7 @@ cd wrapper-adot || exit
 npm install || exit
 
 cd ../../opentelemetry-lambda/nodejs || exit
-npm install || exit
+npm install && npm run build|| exit
 
 mv ./packages/layer/build/workspace/otel-handler ./packages/layer/build/workspace/otel-handler-upstream
 cp "$SOURCEDIR"/scripts/otel-handler ./packages/layer/build/workspace/otel-handler
@@ -27,5 +29,5 @@ cp "$SOURCEDIR"/wrapper-adot/build/src/adot-extension.* ./packages/layer/build/w
 
 cd ./packages/layer/build/workspace || exit
 rm ../layer.zip
-unzip -qo ../../../../../collector/build/collector-extension.zip
+unzip -qo ../../../../../collector/build/opentelemetry-collector-layer-$1.zip
 zip -qr ../layer.zip *

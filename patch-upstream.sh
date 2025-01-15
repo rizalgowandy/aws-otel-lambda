@@ -1,5 +1,5 @@
 #!/bin/bash
-
+set -e
 : <<'END_DOCUMENTATION'
 `patch-upstream.sh`
 
@@ -10,23 +10,40 @@ their Lambdas with Lambda Layers configured to export to the X-Ray backend.
 
 END_DOCUMENTATION
 
+# Run unit tests on ADOT lambdacomponents
+make --directory=adot/collector/lambdacomponents
+
 # Patch some upstream components with ADOT specific components
 cp -rf adot/* opentelemetry-lambda/
 
+# Get current repo path
+CURRENT_DIR=$PWD
+
+
 # Move to the upstream OTel Lambda Collector folder where we will build a
 # collector used in each Lambda layer
-cd opentelemetry-lambda/collector
+cd opentelemetry-lambda
+
+# patch lambda terraform module to v7.19.0
+patch -p1 < ../terraformversion.patch
+
+cd collector
+
+# patch otel version on collector/go.mod
+PATCH_OTEL_VERSION="../../OTEL_Version.patch"
+
+if [ -f $PATCH_OTEL_VERSION ]; then
+    patch -p2 < $PATCH_OTEL_VERSION;
+fi
+
+# patch collector startup to add httpsprovider
+patch -p2 < ../../collector.patch
+
+# patch manager.go to remove lambdacomponents attribute
+patch -p2 < ../../manager.patch
 
 # Replace OTel Collector with ADOT Collector
-go mod edit -replace github.com/open-telemetry/opentelemetry-lambda/collector/lambdacomponents=github.com/aws-observability/aws-otel-collector/pkg/lambdacomponents@v0.17.0
+go mod edit -replace github.com/open-telemetry/opentelemetry-lambda/collector/lambdacomponents=${CURRENT_DIR}/adot/collector/lambdacomponents
 
-# Include X-Ray components for the Collector
-go mod edit -replace github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/awsutil=github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/awsutil@v0.45.1
-go mod edit -replace github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/metrics=github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/metrics@v0.45.1
-go mod edit -replace github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/xray=github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/xray@v0.45.1
-
-# A simple `go mod tidy` does not work.
-# See: https://github.com/aws-observability/aws-otel-collector/issues/926
 rm -fr go.sum
-go mod tidy -go=1.16
-go mod tidy -go=1.17
+go mod tidy
